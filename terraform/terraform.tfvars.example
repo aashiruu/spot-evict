@@ -1,0 +1,5 @@
+aws_region          = "us-east-1"
+allowed_account_id  = "529088258981"
+budget_limit_usd    = "15.0"
+budget_alert_emails = ["you@example.com"]
+max_fleet_size      = 2
