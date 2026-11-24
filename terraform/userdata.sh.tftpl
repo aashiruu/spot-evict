@@ -1,37 +1,51 @@
 #!/usr/bin/env bash
 set -euxo pipefail
 
+BOOT_SCRIPT_TS=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+export INSTANCE_ID=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+export INSTANCE_TYPE=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-type)
+export INSTANCE_LIFECYCLE=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-life-cycle || echo "normal")
+
 cleanup() {
-  aws s3 cp /var/log/cloud-init-output.log "s3://${bucket}/logs/${run_id}.log" || true
+  aws s3 cp /var/log/cloud-init-output.log "s3://${bucket}/logs/${run_id}-$${INSTANCE_ID}.log" || true
   shutdown -h now
 }
 trap cleanup EXIT
 
-TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-export INSTANCE_ID=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
-export INSTANCE_TYPE=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-type)
-
-BOOT_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 aws s3 cp "s3://${bucket}/bin/worker" /usr/local/bin/worker
 chmod +x /usr/local/bin/worker
 
+WATCH_FLAG=""
+if [ "${watch_itn}" = "true" ]; then
+  WATCH_FLAG="-watch-spot-itn"
+fi
+
+WORKER_LAUNCH_TS=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
 /usr/local/bin/worker \
   -chunks ${chunks} \
   -rounds ${rounds} \
   -run-id "${run_id}" \
   -s3-bucket "${bucket}" \
   -checkpoint-every ${ckpt_every} \
+  $WATCH_FLAG \
   -json > /tmp/result.json
 
-DONE_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-python3 -c '
+DONE_TS=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+COMPLETED=$(python3 -c '
 import json, sys
 with open("/tmp/result.json") as f:
     d = json.load(f)
 d["boot_script_started_at"] = sys.argv[1]
-d["boot_script_finished_at"] = sys.argv[2]
+d["worker_launch_at"] = sys.argv[2]
+d["boot_script_finished_at"] = sys.argv[3]
 with open("/tmp/result.json", "w") as f:
     json.dump(d, f, indent=2)
-' "$BOOT_TS" "$DONE_TS"
+print("true" if d.get("completed") else "false")
+' "$BOOT_SCRIPT_TS" "$WORKER_LAUNCH_TS" "$DONE_TS")
 
-aws s3 cp /tmp/result.json "s3://${bucket}/results/${run_id}.json"
+if [ "$COMPLETED" = "true" ]; then
+  aws s3 cp /tmp/result.json "s3://${bucket}/results/${run_id}.json"
+else
+  aws s3 cp /tmp/result.json "s3://${bucket}/results/${run_id}-partial-$${INSTANCE_ID}.json"
+fi

@@ -150,6 +150,7 @@ resource "aws_instance" "baseline" {
     chunks     = var.job_chunks
     rounds     = var.job_rounds
     ckpt_every = var.checkpoint_every
+    watch_itn  = false
   })
 
   tags = {
