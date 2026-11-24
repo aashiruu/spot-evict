@@ -32,3 +32,31 @@ variable "max_fleet_size" {
     error_message = "max_fleet_size must be between 1 and 4."
   }
 }
+variable "baseline_instance_type" {
+  description = "Small On-Demand instance type for baseline runs"
+  type        = string
+  default     = "t3.micro"
+}
+
+variable "baseline_run_id" {
+  description = "Run identifier for the active On-Demand baseline run (empty disables the instance)"
+  type        = string
+  default     = ""
+}
+
+variable "job_chunks" {
+  description = "Number of chunks for the full baseline job"
+  type        = number
+  default     = 100000
+
+  validation {
+    condition     = var.job_chunks >= 1 && var.job_chunks <= 100000
+    error_message = "job_chunks must be between 1 and 100000."
+  }
+}
+
+variable "job_rounds" {
+  description = "SHA-256 rounds per chunk"
+  type        = number
+  default     = 10000
+}

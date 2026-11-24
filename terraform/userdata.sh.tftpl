@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euxo pipefail
+
+cleanup() {
+  aws s3 cp /var/log/cloud-init-output.log "s3://${bucket}/logs/${run_id}.log" || true
+  shutdown -h now
+}
+trap cleanup EXIT
+
+TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+export INSTANCE_ID=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+export INSTANCE_TYPE=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-type)
+
+BOOT_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+aws s3 cp "s3://${bucket}/bin/worker" /usr/local/bin/worker
+chmod +x /usr/local/bin/worker
+
+/usr/local/bin/worker \
+  -chunks ${chunks} \
+  -rounds ${rounds} \
+  -run-id "${run_id}" \
+  -json > /tmp/result.json
+
+DONE_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+python3 -c '
+import json, sys
+with open("/tmp/result.json") as f:
+    d = json.load(f)
+d["boot_script_started_at"] = sys.argv[1]
+d["boot_script_finished_at"] = sys.argv[2]
+with open("/tmp/result.json", "w") as f:
+    json.dump(d, f, indent=2)
+' "$BOOT_TS" "$DONE_TS"
+
+aws s3 cp /tmp/result.json "s3://${bucket}/results/${run_id}.json"
