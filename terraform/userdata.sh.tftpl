@@ -19,6 +19,8 @@ chmod +x /usr/local/bin/worker
   -chunks ${chunks} \
   -rounds ${rounds} \
   -run-id "${run_id}" \
+  -s3-bucket "${bucket}" \
+  -checkpoint-every ${ckpt_every} \
   -json > /tmp/result.json
 
 DONE_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)

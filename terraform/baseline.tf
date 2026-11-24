@@ -98,6 +98,7 @@ resource "aws_iam_role_policy" "worker_s3" {
       Action = [
         "s3:GetObject",
         "s3:PutObject",
+        "s3:DeleteObject",
         "s3:ListBucket"
       ]
       Resource = [
@@ -144,10 +145,11 @@ resource "aws_instance" "baseline" {
   }
 
   user_data = templatefile("${path.module}/userdata.sh.tftpl", {
-    bucket = aws_s3_bucket.artifacts.id
-    run_id = var.baseline_run_id
-    chunks = var.job_chunks
-    rounds = var.job_rounds
+    bucket     = aws_s3_bucket.artifacts.id
+    run_id     = var.baseline_run_id
+    chunks     = var.job_chunks
+    rounds     = var.job_rounds
+    ckpt_every = var.checkpoint_every
   })
 
   tags = {

@@ -60,3 +60,9 @@ variable "job_rounds" {
   type        = number
   default     = 10000
 }
+
+variable "checkpoint_every" {
+  description = "Periodic checkpoint interval in chunks (0 disables)"
+  type        = number
+  default     = 0
+}
