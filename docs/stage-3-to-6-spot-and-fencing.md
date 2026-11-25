@@ -46,5 +46,19 @@
 
 ---
 
-## Stage 5: Fencing & Split-Brain Prevention (In Progress)
-- *Next:* DynamoDB conditional-write lease (`spot-evict-leases`), monotonically increasing `fencing_token`, heartbeat expiration, and `SIGSTOP` frozen-worker split-brain test.
+## Stage 5: Fencing & Split-Brain Prevention (`SIGSTOP` Frozen-Worker Test)
+
+### Architecture
+- **Lease Store:** On-demand DynamoDB table `spot-evict-leases` (`PAY_PER_REQUEST`, primary key `run_id`).
+- **Atomic Acquisition (`Acquire`):** Conditional `UpdateItem` requiring `attribute_not_exists(run_id) OR lease_expires_at < :now_ms`, atomically incrementing `fencing_token` (`ADD fencing_token :one`) and setting `owner_id` + `lease_expires_at`.
+- **Heartbeat & Pre-Write Fence (`VerifyAndRenew`):** Background heartbeat (`ttl / 3`) and synchronous pre-`PutObject` conditional check (`owner_id = :owner AND fencing_token = :token AND lease_expires_at >= :now_ms`). If a worker stalls past `lease_expires_at`, DynamoDB rejects its renewal/write with `ConditionalCheckFailedException` (`ErrFencedOut`, exit code `3`) **before** any S3 write occurs.
+
+### Live AWS DynamoDB + S3 Split-Brain Run (`stage5-sigstop-midflight-201948`)
+1. `W1` (`w1-frozen`) acquired `fencing_token=1` (`ttl=15s`), processed `111` chunks, and was frozen mid-flight via `SIGSTOP`.
+2. After `16s` (past the `15s` lease TTL), `W2` (`w2-replacement`) acquired the expired lease with monotonic `fencing_token=2`, processed all `20,000` chunks (`checkpoint_every=2000`), and wrote `10` checkpoints tagged `f000000000002`.
+3. `SIGCONT` woke `W1`, which immediately failed its conditional DynamoDB check (`HEARTBEAT FENCED OUT: worker=w1-frozen fence=1 lost lease!`), exited with code `3` (`fenced_out=true`), and wrote **0** post-fence objects to S3.
+4. `W2`'s final checksum (`8d01dc8fd92658373d5abcf739108f6ec1809bccbc052215e651b4beb0b71da1`) matched the uninterrupted 20,000-chunk baseline bit-for-bit.
+
+---
+
+## Stage 6: Chaos & Failure Matrix (In Progress)

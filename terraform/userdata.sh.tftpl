@@ -27,6 +27,7 @@ WORKER_LAUNCH_TS=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
   -rounds ${rounds} \
   -run-id "${run_id}" \
   -s3-bucket "${bucket}" \
+  -lease-table "spot-evict-leases" \
   -checkpoint-every ${ckpt_every} \
   $WATCH_FLAG \
   -json > /tmp/result.json
