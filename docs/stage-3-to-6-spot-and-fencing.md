@@ -61,4 +61,13 @@
 
 ---
 
-## Stage 6: Chaos & Failure Matrix (In Progress)
+## Stage 6: Chaos & Failure Matrix
+
+All failure modes were executed against live AWS S3 + DynamoDB and verified against uninterrupted deterministic SHA-256 baselines:
+
+| Chaos Case | Fault Injected | Observed Recovery Behavior | Final Checksum Match |
+| :--- | :--- | :--- | :--- |
+| **A. Corrupted Latest Checkpoint** | Overwrote newest S3 object (`chunk=1500`) with invalid JSON | Rejected (`rejected checkpoints/stage6-case-a-corrupt-203849/ckpt-000000001500-f000000000001.json: missing version or payload_sha256`), fell back to `chunk=1000`, completed remaining 500 chunks | **PASS** |
+| **B. 3 Consecutive Evictions** | 3 sequential IMDSv2 Spot notices across 4 workers | Monotonic fencing + emergency flush chain: `W1(fence=1, resumed=0, end=1826) → W2(fence=2, resumed=1826, end=1826) → W3(fence=3, resumed=1826, end=3304) → W4(fence=4, resumed=3304, end=4000)` | **PASS** |
+| **C. Duplicate / Replay Run** | Started `spot-w5-replay` on already-completed 1,500-chunk run | Acquired `fence=5`, resumed at `chunk=1500`, executed `0` extra chunks | **PASS** |
+| **D. Truncated 0-Byte Object** | Replaced newest S3 object (`chunk=1500`) with 0 bytes | Rejected (`rejected checkpoints/stage6-case-d-trunc-204040/ckpt-000000001500-f000000000001.json: json decode failed: unexpected end of JSON input`), fell back to `chunk=1000`, completed cleanly | **PASS** |
