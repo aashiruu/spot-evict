@@ -63,3 +63,14 @@
 | :--- | :--- | :--- | :--- | :--- |
 | **BEFORE (No Fencing, `-lease-table ""`)** | `stage5-unfenced-before-155814` | Woke up at `16:02:36.406Z` and **wrote stale checkpoint `ckpt-000000000955-f000000000001.json` at `16:02:37.971Z`** (6.85 s *after* `W2` finished!) | Completed `25,000` chunks at `16:02:31.119Z` | **CORRUPTED / SPLIT-BRAIN** (stale `chunk=955` committed post-completion) |
 | **AFTER (DynamoDB Lease + Fencing Token)** | `stage5-sigstop-midflight-201948` | Woke up at `20:27:22.025Z`, immediately failed DynamoDB check (`HEARTBEAT FENCED OUT`), exited **`3`**, wrote **0** S3 objects | Acquired `fence=2`, completed `20,000` chunks (`8d01dc8f...`) | **CLEAN** (bit-for-bit baseline match) |
+
+## Stage 6: Strategy Comparison on Real AWS
+
+Executed on `t3.micro` Spot instances (`100,000` chunks, `10,000` rounds/chunk) using real AWS FIS `aws:ec2:send-spot-instance-interruptions` (`durationBeforeInterruption=PT2M`) on a fixed `t = 45 s` post-launch schedule (`N = 1` per cell to stay well within the `$15` monthly budget cap):
+
+| Strategy | Run ID | Interruptions | Resumed Chunk | Wasted Chunks | Checkpoints Written | Checkpoint Overhead | Total Compute Sec | Final Worker Sec | Checksum Match |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **A-none** | `stage6-A-none-163037` | 1 | 0 | 62876 | 0 | 0 ms | 427.42 s | 262.42 s | PASS |
+| **B-notice-only** | `stage6-B-notice-only-164121` | 1 | 25603 | 0 | 1 | 66.9 ms | 261.68 s | 195.55 s | PASS |
+| **C-periodic** | `stage6-C-periodic-165042` | 1 | 60000 | 5683 | 3 | 249.61 ms | 270.58 s | 105.58 s | PASS |
+| **D-periodic-plus-notice** | `stage6-D-periodic-plus-notice-165857` | 1 | 33640 | 0 | 8 | 632.09 ms | 263.46 s | 175.27 s | PASS |
