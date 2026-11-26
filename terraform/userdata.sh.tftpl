@@ -9,6 +9,9 @@ export INSTANCE_LIFECYCLE=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://1
 
 cleanup() {
   aws s3 cp /var/log/cloud-init-output.log "s3://${bucket}/logs/${run_id}-$${INSTANCE_ID}.log" || true
+  if [ -f /tmp/events.jsonl ]; then
+    aws s3 cp /tmp/events.jsonl "s3://${bucket}/events/${run_id}/$${INSTANCE_ID}.jsonl" || true
+  fi
   shutdown -h now
 }
 trap cleanup EXIT
@@ -21,14 +24,20 @@ if [ "${watch_itn}" = "true" ]; then
   WATCH_FLAG="-watch-spot-itn"
 fi
 
+S3_FLAG="-s3-bucket ${bucket}"
+if [ "${enable_s3}" != "true" ]; then
+  S3_FLAG=""
+fi
+
 WORKER_LAUNCH_TS=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
 /usr/local/bin/worker \
   -chunks ${chunks} \
   -rounds ${rounds} \
   -run-id "${run_id}" \
-  -s3-bucket "${bucket}" \
+  $S3_FLAG \
   -lease-table "spot-evict-leases" \
   -checkpoint-every ${ckpt_every} \
+  -event-log /tmp/events.jsonl \
   $WATCH_FLAG \
   -json > /tmp/result.json
 

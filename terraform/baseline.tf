@@ -151,6 +151,7 @@ resource "aws_instance" "baseline" {
     rounds     = var.job_rounds
     ckpt_every = var.checkpoint_every
     watch_itn  = false
+    enable_s3  = true
   })
 
   tags = {

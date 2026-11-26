@@ -1,3 +1,9 @@
+variable "spot_enable_s3" {
+  description = "Whether the Spot worker uses S3 checkpoints (false = Strategy A none)"
+  type        = bool
+  default     = true
+}
+
 variable "spot_run_id" {
   description = "Run identifier for the active Spot ASG run (empty scales ASG to 0)"
   type        = string
@@ -46,6 +52,7 @@ resource "aws_launch_template" "spot_worker" {
     rounds     = var.job_rounds
     ckpt_every = var.checkpoint_every
     watch_itn  = var.spot_watch_itn
+    enable_s3  = var.spot_enable_s3
   }))
 
   tag_specifications {

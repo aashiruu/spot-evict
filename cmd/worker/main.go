@@ -12,6 +12,7 @@ import (
 "time"
 
 "github.com/aashiruu/spot-evict/internal/checkpoint"
+"github.com/aashiruu/spot-evict/internal/eventlog"
 "github.com/aashiruu/spot-evict/internal/imds"
 "github.com/aashiruu/spot-evict/internal/lease"
 "github.com/aashiruu/spot-evict/internal/workload"
@@ -76,6 +77,7 @@ keepLast := flag.Int("keep-last", 3, "Number of recent checkpoints to retain")
 watchSpotITN := flag.Bool("watch-spot-itn", false, "Poll EC2 IMDSv2 for 2-minute Spot Instance Interruption Notice")
 imdsEndpoint := flag.String("imds-endpoint", "", "Override IMDS base URL (for mocked ITN testing)")
 imdsPollMs := flag.Int("imds-poll-ms", 500, "IMDS Spot ITN polling interval in milliseconds")
+eventLogPath := flag.String("event-log", "", "Path to write structured JSONL event log")
 benchCount := flag.Int("bench-checkpoints", 0, "If >0, benchmark N checkpoint writes to S3 and exit")
 jsonOut := flag.Bool("json", false, "Emit structured JSON output")
 flag.Parse()
@@ -88,6 +90,7 @@ os.Exit(1)
 ctx, cancel := context.WithCancel(context.Background())
 defer cancel()
 
+var s3Client *s3.Client
 var store *checkpoint.S3Store
 var leaseMgr lease.Manager
 if *s3Bucket != "" || *leaseTable != "" {
@@ -97,8 +100,9 @@ fmt.Fprintf(os.Stderr, "aws config error: %v\n", err)
 os.Exit(1)
 }
 if *s3Bucket != "" {
+s3Client = s3.NewFromConfig(cfg)
 store = &checkpoint.S3Store{
-Client: s3.NewFromConfig(cfg),
+Client: s3Client,
 Bucket: *s3Bucket,
 }
 }
@@ -127,17 +131,30 @@ runCheckpointBenchmark(ctx, store, *runID, workerID, *benchCount, *padBytes, *ke
 return
 }
 
-leaseTTL := time.Duration(*leaseTTLMs) * time.Millisecond
+evLog, err := eventlog.New(*eventLogPath, *runID, workerID, os.Getenv("INSTANCE_ID"), *chunks)
+if err != nil {
+fmt.Fprintf(os.Stderr, "event log open error: %v\n", err)
+os.Exit(1)
+}
+defer evLog.Close()
+
 var fencingToken int64 = 1
+var currentChunk atomic.Int64
+evLog.Emit("worker_start", fencingToken, 0, fmt.Sprintf("lifecycle=%s type=%s", os.Getenv("INSTANCE_LIFECYCLE"), os.Getenv("INSTANCE_TYPE")), 0, 0)
+
+leaseTTL := time.Duration(*leaseTTLMs) * time.Millisecond
 var fencedOut atomic.Bool
 
 if leaseMgr != nil {
 l, err := leaseMgr.Acquire(ctx, *runID, workerID, leaseTTL)
 if err != nil {
+evLog.Emit("lease_lost", fencingToken, 0, fmt.Sprintf("acquire_failed: %v", err), 0, 0)
+_ = evLog.FlushToS3(ctx, s3Client, *s3Bucket)
 fmt.Fprintf(os.Stderr, "lease acquire failed (worker=%s run=%s): %v\n", workerID, *runID, err)
 os.Exit(2)
 }
 fencingToken = l.FencingToken
+evLog.Emit("lease_acquired", fencingToken, 0, fmt.Sprintf("ttl_ms=%d", *leaseTTLMs), 0, 0)
 fmt.Fprintf(os.Stderr, "acquired lease run=%s worker=%s fence=%d ttl=%s\n", *runID, workerID, fencingToken, leaseTTL)
 
 hbInterval := leaseTTL / 3
@@ -155,6 +172,7 @@ case <-ticker.C:
 if _, err := leaseMgr.VerifyAndRenew(ctx, *runID, workerID, fencingToken, leaseTTL); err != nil {
 if errors.Is(err, lease.ErrFencedOut) {
 fencedOut.Store(true)
+evLog.Emit("lease_lost", fencingToken, currentChunk.Load(), "heartbeat_fenced_out", 0, 0)
 fmt.Fprintf(os.Stderr, "HEARTBEAT FENCED OUT: worker=%s fence=%d lost lease!\n", workerID, fencingToken)
 return
 }
@@ -182,9 +200,11 @@ os.Exit(1)
 if env != nil {
 state = env.State
 resumedFrom = state.NextChunk
+currentChunk.Store(resumedFrom)
 if leaseMgr == nil {
 fencingToken = env.FencingToken + 1
 }
+evLog.Emit("checkpoint_loaded", fencingToken, resumedFrom, fmt.Sprintf("warnings=%d", len(warnings)), 0, 0)
 fmt.Fprintf(os.Stderr, "resumed run=%s from chunk=%d fence=%d (warnings=%d)\n", *runID, resumedFrom, fencingToken, len(warnings))
 }
 }
@@ -194,6 +214,7 @@ if leaseMgr != nil {
 if _, err := leaseMgr.VerifyAndRenew(ctx, *runID, workerID, fencingToken, leaseTTL); err != nil {
 if errors.Is(err, lease.ErrFencedOut) {
 fencedOut.Store(true)
+evLog.Emit("lease_lost", fencingToken, st.NextChunk, "pre_write_fenced_out", 0, 0)
 }
 return checkpoint.WriteMetrics{}, err
 }
@@ -206,17 +227,33 @@ lastBytes := 0
 interrupted := false
 var emergencyFlushMs float64
 
+// Emit periodic chunk_done progress markers (every 10% of target chunks) for timeline replay
+progressStep := *chunks / 10
+if progressStep < 1 {
+progressStep = 1
+}
+
 for state.NextChunk < state.TotalChunks {
 if fencedOut.Load() {
 break
 }
 if watcher.Triggered() {
 interrupted = true
+n := watcher.Notice()
+detail := ""
+if n != nil {
+detail = fmt.Sprintf("source=%s action=%s", n.Source, n.Action)
+}
+evLog.Emit("notice_received", fencingToken, state.NextChunk, detail, 0, 0)
 break
 }
 if err := workload.ComputeChunk(&state); err != nil {
 fmt.Fprintf(os.Stderr, "worker error: %v\n", err)
 os.Exit(1)
+}
+currentChunk.Store(state.NextChunk)
+if state.NextChunk%progressStep == 0 || state.NextChunk == state.TotalChunks {
+evLog.Emit("chunk_done", fencingToken, state.NextChunk, state.RunningHashHex[:16], 0, 0)
 }
 if store != nil && *ckptEvery > 0 && state.NextChunk%*ckptEvery == 0 && state.NextChunk < state.TotalChunks {
 m, err := saveFenced(state)
@@ -230,6 +267,7 @@ os.Exit(1)
 }
 ckptsWritten++
 lastBytes = m.Bytes
+evLog.Emit("checkpoint_written", fencingToken, state.NextChunk, m.Key, m.Bytes, float64(m.Duration.Microseconds())/1000.0)
 }
 }
 
@@ -250,6 +288,7 @@ os.Exit(1)
 emergencyFlushMs = float64(time.Since(flushStart).Microseconds()) / 1000.0
 ckptsWritten++
 lastBytes = m.Bytes
+evLog.Emit("checkpoint_written", fencingToken, state.NextChunk, "emergency:"+m.Key, m.Bytes, emergencyFlushMs)
 fmt.Fprintf(os.Stderr, "emergency checkpoint flushed in %.2f ms (key=%s)\n", emergencyFlushMs, m.Key)
 }
 }
@@ -263,6 +302,7 @@ os.Exit(1)
 } else {
 ckptsWritten++
 lastBytes = m.Bytes
+evLog.Emit("checkpoint_written", fencingToken, state.NextChunk, "final:"+m.Key, m.Bytes, float64(m.Duration.Microseconds())/1000.0)
 }
 }
 }
@@ -281,6 +321,14 @@ chunksPerSec = float64(processedNow) / elapsed.Seconds()
 }
 
 completed := state.NextChunk >= state.TotalChunks && !fencedOut.Load()
+termReason := "completed"
+if fencedOut.Load() {
+termReason = "fenced_out"
+} else if interrupted {
+termReason = "interrupted_notice"
+}
+evLog.Emit("termination", fencingToken, state.NextChunk, termReason, 0, elapsed.Seconds()*1000.0)
+_ = evLog.FlushToS3(ctx, s3Client, *s3Bucket)
 
 if *jsonOut {
 res := RunResult{

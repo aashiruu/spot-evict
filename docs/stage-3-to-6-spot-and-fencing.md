@@ -46,28 +46,20 @@
 
 ---
 
-## Stage 5: Fencing & Split-Brain Prevention (`SIGSTOP` Frozen-Worker Test)
+## Stage 5: Lease and Fencing
 
-### Architecture
-- **Lease Store:** On-demand DynamoDB table `spot-evict-leases` (`PAY_PER_REQUEST`, primary key `run_id`).
-- **Atomic Acquisition (`Acquire`):** Conditional `UpdateItem` requiring `attribute_not_exists(run_id) OR lease_expires_at < :now_ms`, atomically incrementing `fencing_token` (`ADD fencing_token :one`) and setting `owner_id` + `lease_expires_at`.
-- **Heartbeat & Pre-Write Fence (`VerifyAndRenew`):** Background heartbeat (`ttl / 3`) and synchronous pre-`PutObject` conditional check (`owner_id = :owner AND fencing_token = :token AND lease_expires_at >= :now_ms`). If a worker stalls past `lease_expires_at`, DynamoDB rejects its renewal/write with `ConditionalCheckFailedException` (`ErrFencedOut`, exit code `3`) **before** any S3 write occurs.
+### Architectural Trade-Offs
+1. **DynamoDB Conditional-Write Lease vs. S3 Conditional Writes (`If-None-Match` / `If-Match`):**
+   - **S3 Conditional Writes:** Work for immutable object creation (`If-None-Match: *`) or single-object ETag CAS (`If-Match`), but lack native server-side TTL expiry and atomic monotonic counter increments (`ADD fencing_token :one`) across prefix-keyed checkpoints (`ckpt-<chunk>-f<token>.json`).
+   - **DynamoDB Conditional Lease (`spot-evict-leases`):** Provides single-digit millisecond conditional `UpdateItem` (`attribute_not_exists(run_id) OR lease_expires_at < :now_ms`), atomic monotonic `fencing_token` generation, and synchronous pre-write ownership verification (`owner_id = :owner AND fencing_token = :token AND lease_expires_at >= :now_ms`) before every S3 `PutObject`.
+2. **Lease Length vs. Renewal Rate:**
+   - Setting `lease_ttl_ms = 3000–4000 ms` proved too tight when S3 `ListObjectsV2` + `PutObject` RTT spiked to `~1.5–4.9 s`, causing false self-eviction.
+   - Setting `lease_ttl_ms = 15000 ms` (15 s) with `5000 ms` background heartbeats (`ttl / 3`) absorbs cloud API tail latency without false positives while capping split-brain takeover delay at 15 s.
+3. **Fencing Token on Checkpoint Writes:**
+   - Every S3 checkpoint embeds `fencing_token` both inside its JSON envelope and in its object key (`ckpt-<chunk>-f<token>.json`), and `LoadLatest` orders candidates by `(next_chunk DESC, fencing_token DESC)` after verifying SHA-256 integrity.
 
-### Live AWS DynamoDB + S3 Split-Brain Run (`stage5-sigstop-midflight-201948`)
-1. `W1` (`w1-frozen`) acquired `fencing_token=1` (`ttl=15s`), processed `111` chunks, and was frozen mid-flight via `SIGSTOP`.
-2. After `16s` (past the `15s` lease TTL), `W2` (`w2-replacement`) acquired the expired lease with monotonic `fencing_token=2`, processed all `20,000` chunks (`checkpoint_every=2000`), and wrote `10` checkpoints tagged `f000000000002`.
-3. `SIGCONT` woke `W1`, which immediately failed its conditional DynamoDB check (`HEARTBEAT FENCED OUT: worker=w1-frozen fence=1 lost lease!`), exited with code `3` (`fenced_out=true`), and wrote **0** post-fence objects to S3.
-4. `W2`'s final checksum (`8d01dc8fd92658373d5abcf739108f6ec1809bccbc052215e651b4beb0b71da1`) matched the uninterrupted 20,000-chunk baseline bit-for-bit.
-
----
-
-## Stage 6: Chaos & Failure Matrix
-
-All failure modes were executed against live AWS S3 + DynamoDB and verified against uninterrupted deterministic SHA-256 baselines:
-
-| Chaos Case | Fault Injected | Observed Recovery Behavior | Final Checksum Match |
-| :--- | :--- | :--- | :--- |
-| **A. Corrupted Latest Checkpoint** | Overwrote newest S3 object (`chunk=1500`) with invalid JSON | Rejected (`rejected checkpoints/stage6-case-a-corrupt-203849/ckpt-000000001500-f000000000001.json: missing version or payload_sha256`), fell back to `chunk=1000`, completed remaining 500 chunks | **PASS** |
-| **B. 3 Consecutive Evictions** | 3 sequential IMDSv2 Spot notices across 4 workers | Monotonic fencing + emergency flush chain: `W1(fence=1, resumed=0, end=1826) → W2(fence=2, resumed=1826, end=1826) → W3(fence=3, resumed=1826, end=3304) → W4(fence=4, resumed=3304, end=4000)` | **PASS** |
-| **C. Duplicate / Replay Run** | Started `spot-w5-replay` on already-completed 1,500-chunk run | Acquired `fence=5`, resumed at `chunk=1500`, executed `0` extra chunks | **PASS** |
-| **D. Truncated 0-Byte Object** | Replaced newest S3 object (`chunk=1500`) with 0 bytes | Rejected (`rejected checkpoints/stage6-case-d-trunc-204040/ckpt-000000001500-f000000000001.json: json decode failed: unexpected end of JSON input`), fell back to `chunk=1000`, completed cleanly | **PASS** |
+### Before-and-After `SIGSTOP` Split-Brain Proof
+| Run Mode | Run ID | Frozen Worker (`W1`) Behavior After `SIGCONT` | Replacement (`W2`) Outcome | S3 State Integrity |
+| :--- | :--- | :--- | :--- | :--- |
+| **BEFORE (No Fencing, `-lease-table ""`)** | `stage5-unfenced-before-155814` | Woke up at `16:02:36.406Z` and **wrote stale checkpoint `ckpt-000000000955-f000000000001.json` at `16:02:37.971Z`** (6.85 s *after* `W2` finished!) | Completed `25,000` chunks at `16:02:31.119Z` | **CORRUPTED / SPLIT-BRAIN** (stale `chunk=955` committed post-completion) |
+| **AFTER (DynamoDB Lease + Fencing Token)** | `stage5-sigstop-midflight-201948` | Woke up at `20:27:22.025Z`, immediately failed DynamoDB check (`HEARTBEAT FENCED OUT`), exited **`3`**, wrote **0** S3 objects | Acquired `fence=2`, completed `20,000` chunks (`8d01dc8f...`) | **CLEAN** (bit-for-bit baseline match) |
